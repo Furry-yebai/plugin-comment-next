@@ -130,7 +130,7 @@ spec:
           id: ipLocationEnabled
           key: ipLocationEnabled
           value: true
-          help: 开启后，评论与回复会显示发表时的 IP 属地，例如「广东」「日本」。属地由插件后端解析，前台不会暴露完整 IP。
+          help: 开启后，评论与回复会显示发表时的 IP 属地，例如「广东」「日本」。默认优先使用内置离线库解析，前台不会暴露完整 IP。
         - $formkit: text
           if: "$get(ipLocationEnabled).value === true"
           label: IP 属地接口 URL 模板
@@ -149,7 +149,7 @@ spec:
           key: ipLocationCacheMinutes
           value: 1440
           validation: required
-          help: 同一 IP 在缓存时长内不会重复请求接口，用于降低对第三方接口的调用量。
+          help: 同一 IP 在缓存时长内复用解析结果，避免重复读取离线库或请求在线接口。
         - $formkit: number
           if: "$get(ipLocationEnabled).value === true"
           label: 接口超时（毫秒）
@@ -158,15 +158,15 @@ spec:
           key: ipLocationTimeoutMillis
           value: 3000
           validation: required
-          help: 接口超时、限流或失败时会自动回落到内置离线库（如已开启），评论列表不会因此报错。
+          help: 仅在离线库未命中或关闭离线解析时请求在线接口。此时评论响应会等待接口返回或超时，失败后不展示属地，不影响评论内容。
         - $formkit: switch
           if: "$get(ipLocationEnabled).value === true"
-          label: 使用内置离线库兜底
+          label: 优先使用内置离线库
           name: offlineFallback
           id: ipLocationOfflineFallback
           key: ipLocationOfflineFallback
           value: true
-          help: 插件内置 ip2region 离线库（IPv4 + IPv6），接口不可用时仍能显示中文属地。数据离线解析、不产生任何外部请求，仅在接口没有结果时使用。
+          help: 插件内置 ip2region 离线库（IPv4 + IPv6），优先在本地解析中文属地，命中时不请求在线接口。未命中时再使用上方配置的接口；关闭此项后仅使用在线接口。
     - group: security
       label: 安全设置
       formSchema:

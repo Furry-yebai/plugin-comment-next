@@ -6,6 +6,7 @@ import com.xhhao.comment.widget.network.CommentNextOutboundUriPolicy;
 import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Semaphore;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -15,10 +16,9 @@ import reactor.core.publisher.Mono;
 /**
  * 把评论 IP 解析为属地文本，例如「广东」「日本」。
  *
- * <p>优先使用配置的在线接口，接口超时、限流或返回异常时回落到内置的 ip2region 离线库；
+ * <p>启用离线解析时优先使用内置的 ip2region 数据，未命中时再查询配置的在线接口；
  * 两边都拿不到结果、或 IP 不是公网地址时返回空字符串，调用方据此决定不展示属地。
- * 为避免对第三方接口造成压力并拖慢评论列表，同一个 IP 的并发请求会合并，且在途请求数量受限，
- * 超出上限时本次不展示属地（下一次请求仍会重试）。
+ * 同一个 IP 的并发请求会合并，在线请求数量受限；离线查询不占用在线请求名额。
  */
 @Slf4j
 @Service
@@ -47,6 +47,8 @@ public class CommentNextIpLocationService {
 
     private final Map<String, Mono<String>> inFlightRequests = new ConcurrentHashMap<>();
 
+    private final Semaphore onlineRequests = new Semaphore(MAX_IN_FLIGHT_REQUESTS);
+
     /**
      * 解析属地，永不返回错误。
      */
@@ -70,44 +72,57 @@ public class CommentNextIpLocationService {
         }
 
         var apiUrlTemplate = resolveApiUrlTemplate(config);
-        var cached = cache.get(apiUrlTemplate, ipAddress);
+        var cached = cache.get(apiUrlTemplate, ipAddress, config.isOfflineFallback());
         if (cached.isPresent()) {
             return Mono.just(cached.get());
         }
 
-        var key = cacheKey(apiUrlTemplate, ipAddress);
+        return offlineLocation(ipAddress, config)
+            .map(CommentNextIpLocationText::normalize)
+            .filter(StringUtils::hasText)
+            .doOnNext(location -> cache.put(apiUrlTemplate, ipAddress, config.isOfflineFallback(),
+                location, cacheMinutes(config)))
+            .switchIfEmpty(Mono.defer(() -> resolveOnline(ipAddress, apiUrlTemplate, config)));
+    }
+
+    private Mono<String> resolveOnline(String ipAddress, String apiUrlTemplate,
+        SettingConfigGetter.IpLocationConfig config) {
+        var key = apiUrlTemplate + '\0' + config.isOfflineFallback() + '\0' + ipAddress;
         var pending = inFlightRequests.get(key);
         if (pending != null) {
             return pending;
         }
-        if (inFlightRequests.size() >= MAX_IN_FLIGHT_REQUESTS) {
-            return Mono.just("");
-        }
-
-        return inFlightRequests.computeIfAbsent(key,
-            ignored -> fetchLocation(key, ipAddress, apiUrlTemplate, config));
+        var request = inFlightRequests.computeIfAbsent(key, ignored -> {
+            if (!onlineRequests.tryAcquire()) {
+                return null;
+            }
+            return fetchLocation(key, ipAddress, apiUrlTemplate, config);
+        });
+        return request == null ? Mono.just("") : request;
     }
 
     private Mono<String> fetchLocation(String key, String ipAddress, String apiUrlTemplate,
         SettingConfigGetter.IpLocationConfig config) {
         return onlineLocation(ipAddress, apiUrlTemplate, config)
-            .switchIfEmpty(offlineLocation(ipAddress, config))
             .map(CommentNextIpLocationText::normalize)
             .switchIfEmpty(Mono.just(""))
             .doOnNext(location -> cache.put(
                 apiUrlTemplate,
                 ipAddress,
+                config.isOfflineFallback(),
                 location,
                 location.isBlank() ? NEGATIVE_CACHE_MINUTES : cacheMinutes(config)
             ))
-            .doFinally(signal -> inFlightRequests.remove(key))
+            .doFinally(signal -> {
+                inFlightRequests.remove(key);
+                onlineRequests.release();
+            })
             .cache();
     }
 
     private Mono<String> onlineLocation(String ipAddress, String apiUrlTemplate,
         SettingConfigGetter.IpLocationConfig config) {
-        return client.fetchLocation(ipAddress, apiUrlTemplate, timeout(config))
-            .map(location -> location == null ? "" : location)
+        return Mono.defer(() -> client.fetchLocation(ipAddress, apiUrlTemplate, timeout(config)))
             .filter(StringUtils::hasText)
             .onErrorResume(error -> {
                 log.debug("Failed to resolve IP location from the configured API. ip={}",
@@ -128,10 +143,6 @@ public class CommentNextIpLocationService {
         return StringUtils.hasText(config.getApiUrlTemplate())
             ? config.getApiUrlTemplate().strip()
             : SettingConfigGetter.IpLocationConfig.DEFAULT_API_URL_TEMPLATE;
-    }
-
-    private String cacheKey(String apiUrlTemplate, String ipAddress) {
-        return apiUrlTemplate + '\0' + ipAddress;
     }
 
     private Duration timeout(SettingConfigGetter.IpLocationConfig config) {

@@ -3,6 +3,7 @@ package com.xhhao.comment.widget.iplocation;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import java.time.Duration;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
@@ -20,6 +21,11 @@ class CommentNextIpRegionDatabaseTest {
     @BeforeAll
     void setUp() {
         database = new CommentNextIpRegionDatabase();
+    }
+
+    @AfterAll
+    void tearDown() throws InterruptedException {
+        database.destroy();
     }
 
     @Test

@@ -1,28 +1,26 @@
 package com.xhhao.comment.widget.iplocation;
 
-import java.io.File;
-import java.io.IOException;
-import java.io.InputStream;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import lombok.extern.slf4j.Slf4j;
 import org.lionsoul.ip2region.service.Config;
 import org.lionsoul.ip2region.service.Ip2Region;
+import org.springframework.beans.factory.DisposableBean;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.stereotype.Component;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 /**
- * 内置 ip2region 离线库（IPv4 + IPv6），用于在线接口超时、限流或不可用时兜底。
+ * 内置 ip2region 离线库（IPv4 + IPv6），启用时优先在本地解析属地。
  *
  * <p>xdb 数据文件随插件打包，首次查询时提取到临时目录，并以向量索引（VIndexCache）方式加载，
  * 避免把几十 MB 数据常驻内存。
  */
 @Slf4j
 @Component
-class CommentNextIpRegionDatabase {
+class CommentNextIpRegionDatabase implements DisposableBean {
 
     private static final String XDB_DIRECTORY = "comment-next-ip2region";
 
@@ -34,7 +32,21 @@ class CommentNextIpRegionDatabase {
 
     private final AtomicBoolean initializationFailed = new AtomicBoolean();
 
+    private final ReentrantReadWriteLock lifecycleLock = new ReentrantReadWriteLock();
+
+    private final Path directory;
+
+    private boolean closed;
+
     private volatile Ip2Region ip2Region;
+
+    CommentNextIpRegionDatabase() {
+        this(Path.of(System.getProperty("java.io.tmpdir"), XDB_DIRECTORY));
+    }
+
+    CommentNextIpRegionDatabase(Path directory) {
+        this.directory = directory;
+    }
 
     Mono<String> lookup(String ipAddress) {
         if (initializationFailed.get()) {
@@ -50,16 +62,21 @@ class CommentNextIpRegionDatabase {
     }
 
     private String search(String ipAddress) {
-        var database = database();
-        if (database == null) {
-            return "";
-        }
-
+        lifecycleLock.readLock().lock();
         try {
+            if (closed) {
+                return "";
+            }
+            var database = database();
+            if (database == null) {
+                return "";
+            }
             return CommentNextIpLocationText.fromIp2Region(database.search(ipAddress));
         } catch (Exception e) {
             log.debug("ip2region lookup failed. ip={}", ipAddress, e);
             return "";
+        } finally {
+            lifecycleLock.readLock().unlock();
         }
     }
 
@@ -75,16 +92,15 @@ class CommentNextIpRegionDatabase {
             }
 
             try {
-                var directory = Path.of(System.getProperty("java.io.tmpdir"), XDB_DIRECTORY);
-                Files.createDirectories(directory);
-
                 var v4Config = Config.custom()
-                    .setXdbFile(extract(V4_RESOURCE, directory.resolve("ip2region_v4.xdb")))
+                    .setXdbFile(CommentNextIpRegionDatabaseFiles.extract(
+                        new ClassPathResource(V4_RESOURCE), directory))
                     .setCachePolicy(Config.VIndexCache)
                     .setSearchers(SEARCHER_POOL_SIZE)
                     .asV4();
                 var v6Config = Config.custom()
-                    .setXdbFile(extract(V6_RESOURCE, directory.resolve("ip2region_v6.xdb")))
+                    .setXdbFile(CommentNextIpRegionDatabaseFiles.extract(
+                        new ClassPathResource(V6_RESOURCE), directory))
                     .setCachePolicy(Config.VIndexCache)
                     .setSearchers(SEARCHER_POOL_SIZE)
                     .asV6();
@@ -100,26 +116,17 @@ class CommentNextIpRegionDatabase {
         }
     }
 
-    private File extract(String resource, Path target) throws IOException {
-        var existing = target.toFile();
-        if (existing.isFile() && existing.length() > 0) {
-            return existing;
-        }
-
-        try (InputStream inputStream = CommentNextIpRegionDatabase.class
-            .getResourceAsStream(resource)) {
-            if (inputStream == null) {
-                throw new IOException("找不到内置 IP 库资源：" + resource);
+    @Override
+    public void destroy() throws InterruptedException {
+        lifecycleLock.writeLock().lock();
+        try {
+            closed = true;
+            if (ip2Region != null) {
+                ip2Region.close();
+                ip2Region = null;
             }
-
-            var temporary = Files.createTempFile(
-                target.getParent(),
-                target.getFileName().toString(),
-                ".part"
-            );
-            Files.copy(inputStream, temporary, StandardCopyOption.REPLACE_EXISTING);
-            Files.move(temporary, target, StandardCopyOption.REPLACE_EXISTING);
+        } finally {
+            lifecycleLock.writeLock().unlock();
         }
-        return target.toFile();
     }
 }
